@@ -77,17 +77,28 @@ void ksu_syscall_table_hook(int nr, sys_call_ptr_t fn, sys_call_ptr_t *old)
             break;
         }
     }
-    if (!found) {
-        if (hooked_count < ARRAY_SIZE(hooked_entries)) {
-            hooked_entries[hooked_count].nr = nr;
-            hooked_entries[hooked_count].orig = orig;
-            hooked_count++;
-        } else {
-            pr_warn("hooked_entries full, cannot track syscall %d for restoration\n", nr);
-        }
+    if (!found && hooked_count >= ARRAY_SIZE(hooked_entries)) {
+        pr_warn("hooked_entries full, cannot track syscall %d for restoration\n", nr);
+        mutex_unlock(&hooked_entries_lock);
+        return;
     }
 
-    patch_syscall_table(nr, fn);
+    /*
+     * Record the hook only when the write actually landed: on a device that
+     * refuses the table write (Samsung RKP) the entry would otherwise be
+     * restored later although nothing was ever patched.
+     */
+    if (patch_syscall_table(nr, fn)) {
+        pr_warn("patch syscall %d failed, hook not installed\n", nr);
+        mutex_unlock(&hooked_entries_lock);
+        return;
+    }
+
+    if (!found) {
+        hooked_entries[hooked_count].nr = nr;
+        hooked_entries[hooked_count].orig = orig;
+        hooked_count++;
+    }
 
     mutex_unlock(&hooked_entries_lock);
 }
@@ -325,6 +336,15 @@ void __init __nocfi ksu_syscall_hook_init(void)
 
     ksu_dispatcher_nr = ni_slot;
     ksu_syscall_table_hook(ksu_dispatcher_nr, (sys_call_ptr_t)ksu_syscall_dispatcher, NULL);
+    /*
+     * Read the slot back: the write can be refused, and an inert dispatcher
+     * number would arm the sys_enter redirect for nothing.
+     */
+    if (READ_ONCE(ksu_syscall_table[ni_slot]) != (sys_call_ptr_t)ksu_syscall_dispatcher) {
+        pr_warn("dispatcher unavailable at slot %d; syscall event hooks disabled\n", ni_slot);
+        ksu_dispatcher_nr = -1;
+        return;
+    }
     pr_info("dispatcher installed at slot %d\n", ksu_dispatcher_nr);
 }
 

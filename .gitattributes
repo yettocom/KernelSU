@@ -1,1 +1,2 @@
 *.bat eol=crlf
+*.patch text eol=lf

@@ -43,4 +43,37 @@ config KSU_X86_PATCH_SYSCALL_DISPATCHER
 	  Dynamically patch x64's hardened syscall dispatcher to support syscall hooks. This is a
 	  replacement for a kernel source code patch, and is useful for x86_64 LKM mode.
 
+config KSU_SAMSUNG_KDP
+	bool "Samsung KDP credential support"
+	depends on KSU && ARM64
+	default n
+	help
+	  Install credentials through Samsung KDP read-only credential and PGD
+	  interfaces. Initialization fails closed if required symbols are absent.
+
+config KSU_SAMSUNG_RKP
+	bool "Samsung RKP-safe syscall hooks"
+	depends on KSU && ARM64 && KPROBES
+	default n
+	help
+	  Fall back to address-based kprobes when RKP prevents syscall-table
+	  patching. The setresuid path additionally requires CONFIG_KRETPROBES.
+
+config KSU_SAMSUNG_DEFEX
+	bool "Samsung DEFEX synchronization"
+	depends on KSU && ARM64 && KPROBES
+	default n
+	help
+	  Synchronize DEFEX credential state and bypass enforcement only for a
+	  current task already running as root in the KernelSU SELinux domain.
+
+config KSU_SAMSUNG_NO_PATCH_TEXT
+	bool "Forbid direct kernel text and read-only memory patching"
+	depends on KSU && ARM64
+	default n
+	help
+	  Make direct patch-memory requests fail. The Samsung sucompat and
+	  selinux_hide paths use kprobes instead. The setresuid path additionally
+	  requires CONFIG_KRETPROBES.
+
 endmenu
