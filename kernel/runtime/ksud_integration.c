@@ -562,8 +562,14 @@ void ksu_execveat_hook_ksud(const struct pt_regs *regs)
     ksu_execve_hook_ksud_common(filename_user, argv_user);
 }
 
+/*
+ * __nocfi: on the RKP route these two are handed a stub that lives in a module_alloc'd
+ * page, and an indirect call to an address no module owns fails the CFI check - the
+ * kernel panics.  Dropping the check is what makes the stub callable, the same way the
+ * replacements KSU installs by address are marked.
+ */
 static long (*orig_sys_read)(const struct pt_regs *regs);
-static long ksu_sys_read(const struct pt_regs *regs)
+static long __nocfi ksu_sys_read(const struct pt_regs *regs)
 {
     unsigned int fd = PT_REGS_SYSCALL_PARM1(regs);
     char __user **buf_ptr = (char __user **)&PT_REGS_PARM2(regs);
@@ -574,7 +580,7 @@ static long ksu_sys_read(const struct pt_regs *regs)
 }
 
 static long (*orig_sys_fstat)(const struct pt_regs *regs);
-static long ksu_sys_fstat(const struct pt_regs *regs)
+static long __nocfi ksu_sys_fstat(const struct pt_regs *regs)
 {
     unsigned int fd = PT_REGS_SYSCALL_PARM1(regs);
     void __user *statbuf = (void __user *)PT_REGS_PARM2(regs);
@@ -656,6 +662,13 @@ void __init ksu_ksud_init()
 
     ksu_syscall_table_hook(__NR_read, ksu_sys_read, &orig_sys_read);
     ksu_syscall_table_hook(__NR_fstat, ksu_sys_fstat, &orig_sys_fstat);
+
+    /*
+     * Nothing to fix up afterwards: on an RKP target the slot is not written and the branch
+     * helper publishes the callable entry for the displaced original into orig_sys_read /
+     * orig_sys_fstat itself, before the branch goes live.  A second lookup here would be both
+     * redundant and late - the late part is what used to be a window.
+     */
 
     ret = register_kprobe(&input_event_kp);
     pr_info("ksud: input_event_kp: %d\n", ret);

@@ -6,6 +6,7 @@
 #include <linux/mutex.h>
 #include <asm/cacheflush.h>
 #include "infra/symbol_resolver.h"
+#include "ksu_samsung_rkp.h"
 #include "../patch_memory.h"
 #include "arch.h"
 #include "klog.h" // IWYU pragma: keep
@@ -28,8 +29,10 @@ static DEFINE_MUTEX(hooked_entries_lock);
 static struct syscall_hook_entry hooked_entries[16];
 static int hooked_count = 0;
 
-static int patch_syscall_table(int nr, syscall_fn_t fn)
+static int patch_syscall_table(int nr, syscall_fn_t fn, syscall_fn_t *callthru)
 {
+    int ret;
+
     if (ksu_syscall_table == NULL)
         return -ENOENT;
     if (nr < 0 || nr >= __NR_syscalls)
@@ -38,8 +41,21 @@ static int patch_syscall_table(int nr, syscall_fn_t fn)
     pr_info("patch syscall %d, 0x%lx -> 0x%lx\n", nr, (unsigned long)READ_ONCE(ksu_syscall_table[nr]),
             (unsigned long)fn);
 
-    if (ksu_patch_text(&ksu_syscall_table[nr], &fn, sizeof(fn), KSU_PATCH_TEXT_FLUSH_DCACHE)) {
-        pr_err("patch syscall %d failed\n", nr);
+    /*
+     * On a target that refuses the slot write (Samsung RKP) the slot keeps its value and the
+     * function it points at gets a branch instead.  @callthru is then handed the callable entry
+     * for the displaced original BEFORE that branch goes live, which is what keeps a wrapper that
+     * calls its saved original (ksu_sys_read/ksu_sys_fstat) out of an endless recursion.  The cast
+     * is the module's existing convention for function-pointer slots - ksu_patch_text() itself
+     * traffics in void* for the same reason.
+     */
+    if (callthru && ksu_samsung_rkp_active())
+        ret = ksu_samsung_rkp_branch_patch_callthru(&ksu_syscall_table[nr], &fn, (void **)callthru);
+    else
+        ret = ksu_patch_text(&ksu_syscall_table[nr], &fn, sizeof(fn), KSU_PATCH_TEXT_FLUSH_DCACHE);
+
+    if (ret) {
+        pr_err("patch syscall %d failed: %d\n", nr, ret);
         return -EIO;
     }
 
@@ -72,28 +88,17 @@ void ksu_syscall_table_hook(int nr, syscall_fn_t fn, syscall_fn_t *old)
             break;
         }
     }
-    if (!found && hooked_count >= ARRAY_SIZE(hooked_entries)) {
-        pr_warn("hooked_entries full, cannot track syscall %d for restoration\n", nr);
-        mutex_unlock(&hooked_entries_lock);
-        return;
-    }
-
-    /*
-     * Record the hook only when the write actually landed: on a device that
-     * refuses the table write (Samsung RKP) the entry would otherwise be
-     * restored later although nothing was ever patched.
-     */
-    if (patch_syscall_table(nr, fn)) {
-        pr_warn("patch syscall %d failed, hook not installed\n", nr);
-        mutex_unlock(&hooked_entries_lock);
-        return;
-    }
-
     if (!found) {
-        hooked_entries[hooked_count].nr = nr;
-        hooked_entries[hooked_count].orig = orig;
-        hooked_count++;
+        if (hooked_count < ARRAY_SIZE(hooked_entries)) {
+            hooked_entries[hooked_count].nr = nr;
+            hooked_entries[hooked_count].orig = orig;
+            hooked_count++;
+        } else {
+            pr_warn("hooked_entries full, cannot track syscall %d for restoration\n", nr);
+        }
     }
+
+    patch_syscall_table(nr, fn, old);
 
     mutex_unlock(&hooked_entries_lock);
 }
@@ -112,7 +117,7 @@ void ksu_syscall_table_unhook(int nr)
 
     for (i = 0; i < hooked_count; i++) {
         if (hooked_entries[i].nr == nr) {
-            patch_syscall_table(nr, hooked_entries[i].orig);
+            patch_syscall_table(nr, hooked_entries[i].orig, NULL);
             // Remove entry by swapping with last
             hooked_entries[i] = hooked_entries[--hooked_count];
             mutex_unlock(&hooked_entries_lock);
@@ -211,6 +216,7 @@ bool ksu_has_syscall_hook(int nr)
 void __init ksu_syscall_hook_init(void)
 {
     int ni_slot;
+    syscall_fn_t orig;
 
     memset(syscall_hooks, 0, sizeof(syscall_hooks));
 
@@ -220,29 +226,31 @@ void __init ksu_syscall_hook_init(void)
     if (!ksu_syscall_table)
         return;
 
-#if defined(CONFIG_KSU_SAMSUNG_RKP)
-    pr_info("RKP build: syscall table patch is off\n");
-    ksu_dispatcher_nr = -1;
-    return;
-#endif
-
     // Find one ni_syscall slot for the dispatcher
     if (ksu_find_ni_syscall_slots(&ni_slot, 1) < 1) {
         pr_err("failed to find ni_syscall slot for dispatcher\n");
         return;
     }
 
+    orig = READ_ONCE(ksu_syscall_table[ni_slot]);
+
     ksu_dispatcher_nr = ni_slot;
     ksu_syscall_table_hook(ksu_dispatcher_nr, (syscall_fn_t)ksu_syscall_dispatcher, NULL);
+
     /*
-     * Read the slot back: the write can be refused (Samsung RKP), and an
-     * inert dispatcher number would arm the sys_enter redirect for nothing.
+     * ksu_syscall_table_hook() has no way to report back (upstream signature), so verify the
+     * result here.  A target that refuses the slot write (Samsung RKP) gets a branch at the
+     * function the slot points at instead, and the slot then keeps its old value.  An inert
+     * dispatcher number is worse than none: the sys_enter redirect would hand every hooked
+     * syscall to ni_syscall and return -ENOSYS for the uids those hooks serve.
      */
-    if (READ_ONCE(ksu_syscall_table[ni_slot]) != (syscall_fn_t)ksu_syscall_dispatcher) {
-        pr_warn("dispatcher unavailable at slot %d; syscall event hooks disabled\n", ni_slot);
+    if (READ_ONCE(ksu_syscall_table[ni_slot]) != (syscall_fn_t)ksu_syscall_dispatcher &&
+        !ksu_samsung_rkp_get_stub((void *)orig)) {
+        pr_warn("dispatcher not installed at slot %d; syscall event hooks disabled\n", ni_slot);
         ksu_dispatcher_nr = -1;
         return;
     }
+
     pr_info("dispatcher installed at slot %d\n", ksu_dispatcher_nr);
 }
 

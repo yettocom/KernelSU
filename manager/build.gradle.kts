@@ -26,10 +26,10 @@ fun getGitDescribe(): String {
 }
 
 fun getVersionCode(): Int {
-    val override = System.getenv("KSU_VERSION_CODE")?.toIntOrNull()
-    return override ?: (30000 + getGitCommitCount())
+    val commitCount = getGitCommitCount()
+    return 30000 + commitCount
 }
 
 fun getVersionName(): String {
-    return System.getenv("KSU_VERSION_NAME") ?: getGitDescribe().trimStart('v')
+    return getGitDescribe()
 }

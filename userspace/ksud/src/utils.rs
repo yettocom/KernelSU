@@ -18,6 +18,7 @@ use crate::defs::KSU_TEMP_BACKUP_DIR_NAME;
 use crate::{assets, boot_patch, defs, ksucalls, module, restorecon};
 #[allow(unused_imports)]
 use std::fs::{Permissions, set_permissions};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::prelude::PermissionsExt;
 
 use std::path::PathBuf;
@@ -243,16 +244,46 @@ pub fn stage_daemon() -> Result<()> {
     Ok(())
 }
 
+/// Move a daemon that late-load staged elsewhere into place.
+///
+/// late-load has to install ksud BEFORE it loads kernelsu.ko: loading the module switches this
+/// process into the KernelSU SELinux domain, and the copy into /data/adb/ksud is refused from
+/// there (the destination is left as a zero-byte file).  The kit therefore stages the binary
+/// while it still has the bootstrap context, and this renames it onto the same filesystem.
 pub fn stage_daemon_from(staged_exe: impl AsRef<Path>) -> Result<()> {
+    let staged = staged_exe.as_ref();
     ensure_dir_exists(defs::ADB_DIR)?;
 
-    std::fs::rename(staged_exe.as_ref(), defs::DAEMON_PATH).with_context(|| {
+    // The staged binary sits in a shell-writable directory, so only take a root-owned regular
+    // file that nobody else can rewrite: rename(2) moves a symlink as a symlink, and the
+    // chown/chmod below follow it.
+    let meta = std::fs::symlink_metadata(staged)
+        .with_context(|| format!("Failed to stat staged daemon {}", staged.display()))?;
+    if !meta.is_file() || meta.uid() != 0 || (meta.mode() & 0o022) != 0 {
+        bail!(
+            "Refusing to install {} as the daemon: not a root-owned regular file",
+            staged.display()
+        );
+    }
+
+    // rename(2) replaces the destination atomically, so a stage that cannot happen leaves the
+    // previous daemon in place instead of removing it first.
+    std::fs::rename(staged, defs::DAEMON_PATH).with_context(|| {
         format!(
             "Failed to rename {} to {}",
-            staged_exe.as_ref().display(),
+            staged.display(),
             defs::DAEMON_PATH
         )
     })?;
+
+    // Re-check what actually landed: the chown/chmod below follow symlinks.
+    let meta = std::fs::symlink_metadata(defs::DAEMON_PATH)
+        .with_context(|| format!("Failed to stat {}", defs::DAEMON_PATH))?;
+    if !meta.is_file() {
+        let _ = std::fs::remove_file(defs::DAEMON_PATH);
+        bail!("Refusing to keep a non-regular file at {}", defs::DAEMON_PATH);
+    }
+
     chown(defs::DAEMON_PATH, Some(Uid::ROOT), Some(Gid::ROOT))?;
     #[cfg(unix)]
     set_permissions(defs::DAEMON_PATH, Permissions::from_mode(0o755))?;

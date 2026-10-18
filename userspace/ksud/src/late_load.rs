@@ -61,11 +61,17 @@ pub fn run(_package_name: &String, kmi: Option<String>, allow_shell: bool) -> Re
 
         // 4. Load kernelsu.ko from memory with manual relocation
         info!("Loading kernelsu.ko for KMI {kmi}...");
-        // bundled flag is meaningless in jailbreak mode since we can't flash boot to update it.
+        // Upstream leaves `bundled` off here because jailbreak mode cannot flash boot, so there
+        // is no bundled LKM for the manager to update.  This fork loads its own kernel from the
+        // same kit that installs the manager, and that flag is exactly what the manager turns
+        // into its "custom LKM" badge (HomeUiState.showCustomLkmBadge) and into the LKM-update
+        // card - so report it bundled.  `bundled` is a module parameter the kernel already
+        // provides (kernel/core/init.c: module_param_named(bundled, ...)), so nothing else has
+        // to change and a plain `insmod` still reports the honest default.
         let params = if allow_shell {
-            cstr!("allow_shell=1")
+            cstr!("allow_shell=1 bundled=1")
         } else {
-            cstr!("")
+            cstr!("bundled=1")
         };
         ksuinit::load_module(&ko_data, params).context("Failed to load kernelsu.ko")?;
         info!("kernelsu.ko loaded successfully!");

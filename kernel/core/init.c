@@ -9,6 +9,7 @@
 
 #include "policy/allowlist.h"
 #include "ksu_samsung_kdp.h"
+#include "ksu_samsung_rkp.h"
 #include "policy/app_profile.h"
 #include "policy/feature.h"
 #include "klog.h" // IWYU pragma: keep
@@ -137,6 +138,11 @@ int __init kernelsu_init(void)
 #endif
 
     ksu_init_symbol_resolver();
+
+    /* Before anything that may replace a function: on an RKP target this is what makes
+     * ksu_patch_text() able to serve a function-pointer slot at all. */
+    ksu_samsung_rkp_init();
+
     ret = ksu_samsung_kdp_init();
     if (ret)
         return ret;
@@ -248,6 +254,9 @@ void __exit kernelsu_exit(void)
     ksu_module_blacklist_exit();
 
     ksu_samsung_defex_exit();
+    /* After every layer that could have installed a branch: this restores the functions and
+     * then releases the stub page. */
+    ksu_samsung_rkp_exit();
     ksu_put_cred(ksu_cred);
 }
 

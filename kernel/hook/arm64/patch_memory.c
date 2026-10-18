@@ -6,6 +6,7 @@
 #ifdef __aarch64__
 
 #include "../patch_memory.h"
+#include "ksu_samsung_rkp.h"
 #include "klog.h" // IWYU pragma: keep
 #include "linux/cpumask.h"
 #include "linux/gfp.h" // IWYU pragma: keep
@@ -188,11 +189,15 @@ static int ksu_patch_text_cb(void *arg)
 
 int ksu_patch_text(void *dst, void *src, size_t len, int flags)
 {
-#ifdef CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT
-    pr_warn("patch_text disabled for this Samsung target: dst=0x%lx len=%zu flags=0x%x\n", (unsigned long)dst, len,
-            flags);
-    return -EOPNOTSUPP;
-#else
+    /*
+     * One shape survives on a target whose text and rodata are taken away at EL2, and it is
+     * the one most callers use: an 8-byte function-pointer slot.  It is not written at all -
+     * the function the slot points at gets a branch instead - so the slot stays read-only and
+     * every caller, the table included, reaches the replacement.
+     */
+    if (len == sizeof(void *) && ksu_samsung_rkp_active())
+        return ksu_samsung_rkp_branch_patch(dst, src);
+
     struct patch_text_info info = {
         .dst = dst,
         .src = src,
@@ -202,7 +207,6 @@ int ksu_patch_text(void *dst, void *src, size_t len, int flags)
     };
 
     return stop_machine(ksu_patch_text_cb, &info, cpu_online_mask);
-#endif
 }
 
 /*
