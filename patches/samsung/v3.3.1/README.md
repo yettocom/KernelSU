@@ -24,10 +24,8 @@ below is for review only. Indentation and naming follow upstream KernelSU.
      fn+0 is patched together with the branch in one aarch64_insn_patch_text()
      call, and a PACIASP at fn+0 becomes BTI C so the replacement does not sign an
      already-signed LR.
-   - The route is the one diabl0w's KernelSU fork uses. Unlike his: branches are
-     tracked and put back on module exit, a stub slot that gets reused is drained
-     with synchronize_rcu_tasks() first, and the stub entry is published before the
-     branch goes live, so a wrapper that saved its original can never recurse.
+   - The route is the one diabl0w's KernelSU fork uses; what came from it and where
+     this set diverges is listed under "Basis" below.
    - Callers that keep a saved original go through callthru_*: selinux_hide's four
      replacements (orig_* stays the real function for restoration), and the arm64
      syscall table hook, which also gains a callthru out-parameter and a read-back
@@ -49,6 +47,51 @@ below is for review only. Indentation and naming follow upstream KernelSU.
    manager reports the kernel as its bundled LKM.
 
 Installs that do not use the late-load flow only need patch 1.
+
+Basis: diabl0w's KernelSU fork (github.com/diabl0w/KernelSU)
+
+The RKP route and the Samsung compatibility are his design, validated on hardware
+before this set existed. Taken from it:
+
+- replacing a function by branching at the function the slot points at, instead of
+  writing the slot, so the syscall table, the write_op array, sel_handle_status_ops.open
+  and the LSM slots keep their value and every caller - the table included - still
+  reaches the replacement; the BTI/PAC preamble is skipped, and a PACIASP at fn+0
+  becomes BTI C so the replacement does not sign an already-signed LR;
+- the 16-byte stub next to the function, callable at +4:
+  [kCFI type hash][landing pad][displaced instruction][B back];
+- committing fn+0 and the branch in one aarch64_insn_patch_text() call (his "Fix RKP
+  to do bulk write"), so no CPU observes a partial state;
+- the KDP credential install path through prepare_ro_creds() / kdp_assign_pgd();
+- the shape of the DEFEX bypass: redirect the enforcement point to a function that
+  answers "no violation", rather than clearing its argument and relying on the
+  vendor's own NULL check;
+- the proof that text is writable on these devices, which is what let this set drop
+  the NO_PATCH_TEXT / kprobe fallbacks altogether.
+
+Where this set diverges:
+
+- DEFEX scope. His defex.c answers "no violation" for every task; here only the task
+  that loaded the module and a root task already in the ksu domain are skipped, and
+  DEFEX's own credential copy is kept in sync through get_task_creds() /
+  set_task_creds() so it never sees uid 0 there. Every other process keeps being
+  policed.
+- Exit. His ksu_rkp_branch_exit() marks the stub page NX and frees it, leaving the
+  branches installed; here every site is restored (the DEFEX site included) before
+  the page is released, and a site that cannot be restored is reported.
+- Stub slot reuse: a slot handed out again is drained with synchronize_rcu_tasks()
+  first, so no task is still executing a stub that is about to be rewritten.
+- Callers that keep a saved original reach the real function through callthru_*
+  (his API has no such out-parameter, so such a caller would call back into the
+  replacement).
+- KDP: the credential's reference count is taken and dropped through kdp_usecount_*,
+  so both ends of its life use Samsung's own counter.
+- Missing Samsung symbols degrade to the standard credential path instead of failing
+  module init, so the same module still loads on non-Samsung targets.
+
+His rooting tool (github.com/diabl0w/DFRoot) is a separate thing: it turns DEFEX off
+globally and sets SELinux permissive before a module is loaded. Our DFRoot build keeps
+its permissive step but leaves DEFEX to this patch set.
 
 Configuration:
 
