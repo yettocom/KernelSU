@@ -1,0 +1,199 @@
+diff --git a/userspace/ksud/src/late_load.rs b/userspace/ksud/src/late_load.rs
+index a7434d02..5dfe0d70 100644
+--- a/userspace/ksud/src/late_load.rs
++++ b/userspace/ksud/src/late_load.rs
+@@ -1,7 +1,7 @@
+ use anyhow::{Context, Result};
+ use log::{info, warn};
+ use rustix::cstr;
+-use std::{process::Command, time::Instant};
++use std::time::Instant;
+ 
+ use crate::module::{ScriptWait, handle_updated_modules, prune_modules};
+ use crate::{assets, defs, init_event, metamodule, restorecon, utils};
+@@ -35,11 +35,14 @@ fn dump_process_info(label: &str) {
+     );
+ }
+ 
+-pub fn run(package_name: &String, kmi: Option<String>, allow_shell: bool) -> Result<()> {
+-    utils::daemonize(false)?;
++pub fn run(_package_name: &String, kmi: Option<String>, allow_shell: bool) -> Result<()> {
+     info!("late-load command triggered!");
+     dump_process_info("late-load start");
+ 
++    // Copy the daemon before loading the module changes this process's
++    // security context. The remaining install steps require KernelSU policy.
++    utils::stage_daemon_from("/data/local/tmp/.ksud-stage").context("Failed to stage ksud")?;
++
+     // 1. Check if KernelSU is already loaded
+     if ksuinit::has_kernelsu() {
+         info!("KernelSU already loaded, skip loading ko");
+@@ -58,11 +61,17 @@ pub fn run(package_name: &String, kmi: Option<String>, allow_shell: bool) -> Res
+ 
+         // 4. Load kernelsu.ko from memory with manual relocation
+         info!("Loading kernelsu.ko for KMI {kmi}...");
+-        // bundled flag is meaningless in jailbreak mode since we can't flash boot to update it.
++        // Upstream leaves `bundled` off here because jailbreak mode cannot flash boot, so there
++        // is no bundled LKM for the manager to update.  This fork loads its own kernel from the
++        // same kit that installs the manager, and that flag is exactly what the manager turns
++        // into its "custom LKM" badge (HomeUiState.showCustomLkmBadge) and into the LKM-update
++        // card - so report it bundled.  `bundled` is a module parameter the kernel already
++        // provides (kernel/core/init.c: module_param_named(bundled, ...)), so nothing else has
++        // to change and a plain `insmod` still reports the honest default.
+         let params = if allow_shell {
+-            cstr!("allow_shell=1")
++            cstr!("allow_shell=1 bundled=1")
+         } else {
+-            cstr!("")
++            cstr!("bundled=1")
+         };
+         ksuinit::load_module(&ko_data, params).context("Failed to load kernelsu.ko")?;
+         info!("kernelsu.ko loaded successfully!");
+@@ -79,7 +88,7 @@ pub fn run(package_name: &String, kmi: Option<String>, allow_shell: bool) -> Res
+         warn!("clear temp configs failed: {e}");
+     }
+ 
+-    utils::install(None, None).context("Failed to install ksud")?;
++    utils::finish_install(None, None).context("Failed to finish ksud installation")?;
+ 
+     // 5. Handle module updates
+     if let Err(e) = handle_updated_modules() {
+@@ -132,18 +141,5 @@ pub fn run(package_name: &String, kmi: Option<String>, allow_shell: bool) -> Res
+     // 13. Execute boot-completed stage scripts (non-blocking)
+     init_event::run_stage("boot-completed", ScriptWait::NoWait);
+ 
+-    // 14. Restart Manager so it gets a fresh ksu fd from the newly loaded kernel module
+-    info!("Restarting KernelSU Manager {package_name}...");
+-    let _ = Command::new("am")
+-        .args(["force-stop", package_name])
+-        .status();
+-    let _ = Command::new("am")
+-        .args([
+-            "start",
+-            "-n",
+-            &format!("{package_name}/me.weishu.kernelsu.ui.MainActivity"),
+-        ])
+-        .status();
+-
+     Ok(())
+ }
+diff --git a/userspace/ksud/src/utils.rs b/userspace/ksud/src/utils.rs
+index 33653c51..283a518c 100644
+--- a/userspace/ksud/src/utils.rs
++++ b/userspace/ksud/src/utils.rs
+@@ -1,6 +1,7 @@
+ use anyhow::{Context, Error, Ok, Result, bail};
+-use rustix::fs::{Mode, OFlags, open};
++use rustix::fs::{Mode, OFlags, chown, open};
+ use rustix::process::setpgid;
++use rustix::thread::{Gid, Uid};
+ use rustix::stdio::{dup2_stderr, dup2_stdin, dup2_stdout};
+ use std::{
+     ffi::{CStr, CString, c_char, c_void},
+@@ -17,6 +18,7 @@ use crate::defs::KSU_TEMP_BACKUP_DIR_NAME;
+ use crate::{assets, boot_patch, defs, ksucalls, module, restorecon};
+ #[allow(unused_imports)]
+ use std::fs::{Permissions, set_permissions};
++use std::os::unix::fs::MetadataExt;
+ use std::os::unix::prelude::PermissionsExt;
+ 
+ use std::path::PathBuf;
+@@ -229,7 +231,7 @@ fn link_ksud_to_bin() -> Result<()> {
+     Ok(())
+ }
+ 
+-pub fn install(libadbroot: Option<PathBuf>, data_path: Option<PathBuf>) -> Result<()> {
++pub fn stage_daemon() -> Result<()> {
+     ensure_dir_exists(defs::ADB_DIR)?;
+     let _ = std::fs::remove_file(defs::DAEMON_PATH);
+     std::fs::copy(
+@@ -238,6 +240,66 @@ pub fn install(libadbroot: Option<PathBuf>, data_path: Option<PathBuf>) -> Resul
+         "/proc/self/exe",
+         defs::DAEMON_PATH,
+     )?;
++
++    Ok(())
++}
++
++/// Move a daemon that late-load staged elsewhere into place.
++///
++/// late-load has to install ksud BEFORE it loads kernelsu.ko: loading the module switches this
++/// process into the KernelSU SELinux domain, and the copy into /data/adb/ksud is refused from
++/// there (the destination is left as a zero-byte file).  The kit therefore stages the binary
++/// while it still has the bootstrap context, and this renames it onto the same filesystem.
++///
++/// A caller that stages nothing (DFRoot's bootstrap, Magica) is already running the daemon it
++/// wants installed, so that case falls back to copying /proc/self/exe - still before the module
++/// load, so still from the bootstrap context.
++pub fn stage_daemon_from(staged_exe: impl AsRef<Path>) -> Result<()> {
++    let staged = staged_exe.as_ref();
++    ensure_dir_exists(defs::ADB_DIR)?;
++
++    if std::fs::symlink_metadata(staged).is_err() {
++        return stage_daemon();
++    }
++
++    // The staged binary sits in a shell-writable directory, so only take a root-owned regular
++    // file that nobody else can rewrite: rename(2) moves a symlink as a symlink, and the
++    // chown/chmod below follow it.
++    let meta = std::fs::symlink_metadata(staged)
++        .with_context(|| format!("Failed to stat staged daemon {}", staged.display()))?;
++    if !meta.is_file() || meta.uid() != 0 || (meta.mode() & 0o022) != 0 {
++        bail!(
++            "Refusing to install {} as the daemon: not a root-owned regular file",
++            staged.display()
++        );
++    }
++
++    // rename(2) replaces the destination atomically, so a stage that cannot happen leaves the
++    // previous daemon in place instead of removing it first.
++    std::fs::rename(staged, defs::DAEMON_PATH).with_context(|| {
++        format!(
++            "Failed to rename {} to {}",
++            staged.display(),
++            defs::DAEMON_PATH
++        )
++    })?;
++
++    // Re-check what actually landed: the chown/chmod below follow symlinks.
++    let meta = std::fs::symlink_metadata(defs::DAEMON_PATH)
++        .with_context(|| format!("Failed to stat {}", defs::DAEMON_PATH))?;
++    if !meta.is_file() {
++        let _ = std::fs::remove_file(defs::DAEMON_PATH);
++        bail!("Refusing to keep a non-regular file at {}", defs::DAEMON_PATH);
++    }
++
++    chown(defs::DAEMON_PATH, Some(Uid::ROOT), Some(Gid::ROOT))?;
++    #[cfg(unix)]
++    set_permissions(defs::DAEMON_PATH, Permissions::from_mode(0o755))?;
++
++    Ok(())
++}
++
++pub fn finish_install(libadbroot: Option<PathBuf>, data_path: Option<PathBuf>) -> Result<()> {
+     restorecon::lsetfilecon(defs::DAEMON_PATH, restorecon::KSU_CON)?;
+     // install binary assets
+     assets::ensure_binaries(false).with_context(|| "Failed to extract assets")?;
+@@ -275,6 +337,11 @@ pub fn install(libadbroot: Option<PathBuf>, data_path: Option<PathBuf>) -> Resul
+     Ok(())
+ }
+ 
++pub fn install(libadbroot: Option<PathBuf>, data_path: Option<PathBuf>) -> Result<()> {
++    stage_daemon()?;
++    finish_install(libadbroot, data_path)
++}
++
+ pub fn uninstall(package_name: &str) -> Result<()> {
+     if Path::new(defs::MODULE_DIR).exists() {
+         println!("- Uninstall modules..");
+@@ -319,10 +386,6 @@ pub fn daemonize_with<F: FnOnce() -> Result<()>>(use_init_pgrp: bool, configure:
+     Ok(())
+ }
+ 
+-pub fn daemonize(use_init_pgrp: bool) -> Result<()> {
+-    daemonize_with(use_init_pgrp, || Ok(()))
+-}
+-
+ pub fn create_daemon(use_init_pgrp: bool) -> Result<bool> {
+     create_daemon_with(use_init_pgrp, || Ok(()))
+ }
